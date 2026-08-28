@@ -223,19 +223,30 @@
         <div class="settings-section">
           <h3>🔗 Синхронизация</h3>
           <div class="form-group">
-            <label>URL Google Apps Script</label>
+            <label>URL Google Apps Script (GAS)</label>
             <input type="url" id="gasUrl" placeholder="https://script.google.com/macros/s/.../exec">
+            <small style="color:var(--text-secondary)">Разверните Code.gs как Веб-приложение и вставьте URL</small>
           </div>
+          <button class="btn btn-secondary" id="testGasBtn">🔗 Проверить GAS</button>
+          <button class="btn btn-primary" id="syncBtn">🔄 Синхронизировать</button>
+          <hr style="margin:16px 0;border-color:var(--border)">
           <div class="form-group">
             <label>Telegram Bot Token</label>
-            <input type="text" id="tgToken" placeholder="123456:ABC...">
+            <input type="text" id="tgToken" placeholder="123456:ABC-DEF...">
+            <small style="color:var(--text-secondary)">Получите у @BotFather командой /newbot</small>
           </div>
           <div class="form-group">
             <label>Telegram Chat ID</label>
-            <input type="text" id="tgChatId" placeholder="@username или число">
+            <input type="text" id="tgChatId" placeholder="@username или 123456789">
+            <small style="color:var(--text-secondary)">Узнайте у @userinfobot или напишите боту /start</small>
           </div>
-          <button class="btn btn-primary" id="testTgBtn">📨 Проверить Telegram</button>
-          <button class="btn btn-primary" id="syncBtn">🔄 Синхронизировать с GAS</button>
+          <button class="btn btn-secondary" id="testTgBtn">📨 Проверить Telegram</button>
+          <hr style="margin:16px 0;border-color:var(--border)">
+          <div class="form-group">
+            <label>GitHub Token (для деплоя)</label>
+            <input type="text" id="ghToken" placeholder="ghp_...">
+            <small style="color:var(--text-secondary)">Нужен только если хотите обновлять сайт через API</small>
+          </div>
         </div>
         <div class="settings-section">
           <h3>📤 Экспорт / Импорт</h3>
