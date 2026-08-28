@@ -128,6 +128,7 @@ let categories = [];
 let gasUrl = localStorage.getItem('gasUrl') || '';
 let tgToken = localStorage.getItem('tgToken') || '';
 let tgChatId = localStorage.getItem('tgChatId') || '';
+let ghToken = localStorage.getItem('ghToken') || '';
 
 const $ = (sel) => document.querySelector(sel);
 const $$ = (sel) => document.querySelectorAll(sel);
@@ -212,6 +213,7 @@ function initEventListeners() {
   $('#addCategoryBtn').addEventListener('click', addCategory);
 
   $('#syncBtn').addEventListener('click', syncWithGAS);
+  $('#testGasBtn').addEventListener('click', testGAS);
   $('#testTgBtn').addEventListener('click', testTelegram);
   $('#exportBtn').addEventListener('click', exportData);
   $('#importBtn').addEventListener('click', () => $('#importFile').click());
@@ -221,6 +223,7 @@ function initEventListeners() {
   $('#gasUrl').addEventListener('change', (e) => { gasUrl = e.target.value; localStorage.setItem('gasUrl', gasUrl); });
   $('#tgToken').addEventListener('change', (e) => { tgToken = e.target.value; localStorage.setItem('tgToken', tgToken); });
   $('#tgChatId').addEventListener('change', (e) => { tgChatId = e.target.value; localStorage.setItem('tgChatId', tgChatId); });
+  $('#ghToken').addEventListener('change', (e) => { ghToken = e.target.value; localStorage.setItem('ghToken', ghToken); });
 
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') closeAllModals(); });
 }
@@ -698,6 +701,7 @@ function requestNotificationPermission() {
 
 async function sendTelegramNotification(task) {
   if (!tgToken || !tgChatId) return;
+  if (window.location.protocol === 'file:') return; // Can't send from file://
   const text = '🔔 *Напоминание*\\n\\n*' + task.title + '*' + (task.description ? '\\n' + task.description : '') + '\\n📅 ' + task.date + (task.time ? ' ' + task.time : '');
   try {
     await fetch('https://api.telegram.org/bot' + tgToken + '/sendMessage', {
@@ -705,19 +709,31 @@ async function sendTelegramNotification(task) {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ chat_id: tgChatId, text: text, parse_mode: 'MarkdownV2' })
     });
-  } catch (e) { console.error('TG error', e); }
+  } catch (e) { console.error('TG error:', e); }
 }
 
 async function testTelegram() {
   if (!tgToken || !tgChatId) { showToast('Заполните Token и Chat ID'); return; }
+  if (window.location.protocol === 'file:') {
+    showToast('⚠️ Запустите через http://localhost');
+    return;
+  }
+  showToast('📨 Отправка теста...');
   try {
     const res = await fetch('https://api.telegram.org/bot' + tgToken + '/sendMessage', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: tgChatId, text: 'Заметки — Тест! Бот работает' })
+      body: JSON.stringify({ chat_id: tgChatId, text: '📝 Заметки — Тест! Бот работает ✅' })
     });
-    showToast(res.ok ? 'Сообщение отправлено' : 'Ошибка');
-  } catch (e) { showToast('Ошибка сети'); }
+    const data = await res.json();
+    if (res.ok && data.ok) {
+      showToast('✅ Сообщение отправлено!');
+    } else {
+      showToast('❌ Telegram: ' + (data.description || 'Неизвестная ошибка'));
+    }
+  } catch (e) {
+    showToast('❌ Ошибка сети: ' + e.message);
+  }
 }
 
 function addToGoogleCalendar(task) {
@@ -733,11 +749,22 @@ async function queueSync(action, table, data) {
 }
 
 async function syncWithGAS() {
-  if (!gasUrl || !navigator.onLine) return;
+  if (!gasUrl) { showToast('Введите URL GAS в настройках'); return; }
+  if (!navigator.onLine) { showToast('Нет интернет-соединения'); return; }
+
+  // Check if running from file:// (CORS blocked)
+  if (window.location.protocol === 'file:') {
+    showToast('⚠️ Запустите через http://localhost (см. инструкцию)');
+    return;
+  }
+
   const queue = await dbOrderBy('syncQueue', 'timestamp');
+  showToast('🔄 Синхронизация...');
+
   if (queue.length === 0) {
     try {
       const res = await fetch(gasUrl + '?action=getAll');
+      if (!res.ok) throw new Error('HTTP ' + res.status);
       const data = await res.json();
       if (data.tasks) {
         for (const t of data.tasks) {
@@ -746,20 +773,45 @@ async function syncWithGAS() {
         }
       }
       renderView();
-    } catch (e) { console.error('Sync pull error', e); }
+      showToast('✅ Данные загружены с GAS');
+    } catch (e) {
+      console.error('Sync pull error:', e);
+      showToast('❌ Ошибка GAS: ' + e.message);
+    }
     return;
   }
+
   try {
     const res = await fetch(gasUrl, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ action: 'sync', data: queue })
     });
-    if (res.ok) {
-      await dbClear('syncQueue');
-      showToast('Синхронизация завершена');
-    }
-  } catch (e) { console.error('Sync push error', e); }
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    await dbClear('syncQueue');
+    showToast('✅ Синхронизация завершена');
+  } catch (e) {
+    console.error('Sync push error:', e);
+    showToast('❌ Ошибка GAS: ' + e.message);
+  }
+}
+
+async function testGAS() {
+  if (!gasUrl) { showToast('Введите URL GAS'); return; }
+  if (window.location.protocol === 'file:') {
+    showToast('⚠️ Запустите через http://localhost');
+    return;
+  }
+  showToast('🔗 Проверка GAS...');
+  try {
+    const res = await fetch(gasUrl + '?action=getAll');
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const data = await res.json();
+    const taskCount = data.tasks ? data.tasks.length : 0;
+    showToast('✅ GAS работает! Задач: ' + taskCount);
+  } catch (e) {
+    showToast('❌ GAS недоступен: ' + e.message);
+  }
 }
 
 async function exportData() {
@@ -802,6 +854,7 @@ function openSettingsModal() {
   $('#gasUrl').value = gasUrl;
   $('#tgToken').value = tgToken;
   $('#tgChatId').value = tgChatId;
+  $('#ghToken').value = ghToken;
   $('#settingsModal').classList.add('active');
 }
 
