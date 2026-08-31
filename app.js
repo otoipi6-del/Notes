@@ -2,122 +2,149 @@
 
 dayjs.locale('ru');
 
-// ===== Database =====
-let db;
-let useMemory = false;
+// ===== Storage (IndexedDB -> localStorage fallback) =====
+let useStorage = 'idb'; // 'idb' or 'local'
 let memStore = { tasks: [], categories: [], attachments: [], syncQueue: [] };
 let nextId = { tasks: 1, categories: 1, attachments: 1, syncQueue: 1 };
+let db = null;
 
 const DEFAULT_CATEGORIES = [
-  { name: 'Работа', order: 1 },
-  { name: 'Личное', order: 2 },
-  { name: 'Здоровье', order: 3 },
-  { name: 'Другое', order: 4 }
+  { id: 1, name: 'Работа', order: 1 },
+  { id: 2, name: 'Личное', order: 2 },
+  { id: 3, name: 'Здоровье', order: 3 },
+  { id: 4, name: 'Другое', order: 4 }
 ];
 
-async function initDB() {
-  console.log('[Notes] Starting DB init...');
+function storageKey(table) { return 'notes_' + table; }
 
-  // Always delete old DB to avoid schema mismatch
+function loadFromLocal(table) {
   try {
-    await Dexie.delete('NotesAppDB');
-    console.log('[Notes] Old DB deleted');
+    const raw = localStorage.getItem(storageKey(table));
+    return raw ? JSON.parse(raw) : [];
+  } catch (e) { return []; }
+}
+
+function saveToLocal(table, data) {
+  try {
+    localStorage.setItem(storageKey(table), JSON.stringify(data));
   } catch (e) {
-    console.log('[Notes] No old DB to delete');
+    console.warn('[Notes] localStorage save failed:', e);
   }
+}
 
-  db = new Dexie('NotesAppDB');
-  // Simple schema - only auto-increment id, filter in JS
-  db.version(1).stores({
-    tasks: '++id',
-    categories: '++id',
-    attachments: '++id',
-    syncQueue: '++id'
-  });
+async function initDB() {
+  console.log('[Notes] Starting storage init...');
 
+  // Try IndexedDB first with a NEW name to avoid schema conflicts
   try {
+    db = new Dexie('NotesAppDB_v2');
+    db.version(1).stores({
+      tasks: '++id',
+      categories: '++id',
+      attachments: '++id',
+      syncQueue: '++id'
+    });
     await db.open();
     console.log('[Notes] IndexedDB opened OK');
-  } catch (err) {
-    console.warn('[Notes] IndexedDB failed, using memory:', err);
-    useMemory = true;
-    memStore.categories = DEFAULT_CATEGORIES.map((c, i) => ({ id: i + 1, ...c }));
-    nextId.categories = 5;
-    showToast('Работа без сохранения (режим инкогнито)');
-    return;
-  }
+    useStorage = 'idb';
 
-  try {
+    // Init categories
     const count = await db.categories.count();
     if (count === 0) {
-      await db.categories.bulkAdd(DEFAULT_CATEGORIES);
-      console.log('[Notes] Default categories added');
+      await db.categories.bulkAdd(DEFAULT_CATEGORIES.map(c => ({ name: c.name, order: c.order })));
+      console.log('[Notes] Default categories added to IDB');
     }
-  } catch (e) {
-    console.warn('[Notes] Categories init error:', e);
+    return;
+  } catch (err) {
+    console.warn('[Notes] IndexedDB failed:', err.message);
   }
+
+  // Fallback to localStorage
+  console.log('[Notes] Switching to localStorage');
+  useStorage = 'local';
+
+  // Init categories in localStorage
+  const cats = loadFromLocal('categories');
+  if (cats.length === 0) {
+    saveToLocal('categories', DEFAULT_CATEGORIES);
+    console.log('[Notes] Default categories added to localStorage');
+  }
+
+  // Restore nextId from localStorage
+  const tasks = loadFromLocal('tasks');
+  const atts = loadFromLocal('attachments');
+  const sync = loadFromLocal('syncQueue');
+  nextId.tasks = tasks.length > 0 ? Math.max(...tasks.map(t => t.id || 0)) + 1 : 1;
+  nextId.categories = cats.length > 0 ? Math.max(...cats.map(c => c.id || 0)) + 1 : 5;
+  nextId.attachments = atts.length > 0 ? Math.max(...atts.map(a => a.id || 0)) + 1 : 1;
+  nextId.syncQueue = sync.length > 0 ? Math.max(...sync.map(s => s.id || 0)) + 1 : 1;
+
+  showToast('Работа в локальном режиме (данные сохраняются)');
 }
 
 // DB wrapper functions
 async function dbGetAll(table) {
-  if (useMemory) return memStore[table].slice();
-  return db[table].toArray();
+  if (useStorage === 'idb') return db[table].toArray();
+  return loadFromLocal(table);
 }
 
 async function dbGet(table, id) {
-  if (useMemory) return memStore[table].find(x => x.id === id) || null;
-  return db[table].get(id);
+  if (useStorage === 'idb') return db[table].get(id);
+  const items = loadFromLocal(table);
+  return items.find(x => x.id === id) || null;
 }
 
 async function dbAdd(table, data) {
   console.log('[Notes] dbAdd', table, JSON.stringify(data).substring(0, 200));
-  if (useMemory) {
-    const id = nextId[table]++;
-    memStore[table].push({ ...data, id: id });
-    return id;
+  if (useStorage === 'idb') {
+    try {
+      const id = await db[table].add(data);
+      console.log('[Notes] IDB add success, id=', id);
+      return id;
+    } catch (err) {
+      console.error('[Notes] IDB add FAILED:', err, 'data=', data);
+      throw err;
+    }
   }
-  try {
-    const id = await db[table].add(data);
-    console.log('[Notes] DB add success, id=', id);
-    return id;
-  } catch (err) {
-    console.error('[Notes] DB add FAILED:', err, 'data=', data);
-    throw err;
-  }
+  // localStorage mode
+  const items = loadFromLocal(table);
+  const id = nextId[table]++;
+  items.push({ ...data, id: id });
+  saveToLocal(table, items);
+  console.log('[Notes] localStorage add success, id=', id);
+  return id;
 }
 
 async function dbUpdate(table, id, data) {
-  if (useMemory) {
-    const idx = memStore[table].findIndex(x => x.id === id);
-    if (idx >= 0) memStore[table][idx] = { ...memStore[table][idx], ...data };
-    return;
+  if (useStorage === 'idb') return db[table].update(id, data);
+  const items = loadFromLocal(table);
+  const idx = items.findIndex(x => x.id === id);
+  if (idx >= 0) {
+    items[idx] = { ...items[idx], ...data };
+    saveToLocal(table, items);
   }
-  return db[table].update(id, data);
 }
 
 async function dbDelete(table, id) {
-  if (useMemory) {
-    memStore[table] = memStore[table].filter(x => x.id !== id);
-    return;
-  }
-  return db[table].delete(id);
+  if (useStorage === 'idb') return db[table].delete(id);
+  const items = loadFromLocal(table).filter(x => x.id !== id);
+  saveToLocal(table, items);
 }
 
 async function dbBulkPut(table, items) {
-  if (useMemory) {
-    for (const item of items) {
-      const idx = memStore[table].findIndex(x => x.id === item.id);
-      if (idx >= 0) memStore[table][idx] = item;
-      else memStore[table].push(item);
-    }
-    return;
+  if (useStorage === 'idb') return db[table].bulkPut(items);
+  const existing = loadFromLocal(table);
+  for (const item of items) {
+    const idx = existing.findIndex(x => x.id === item.id);
+    if (idx >= 0) existing[idx] = item;
+    else existing.push(item);
   }
-  return db[table].bulkPut(items);
+  saveToLocal(table, existing);
 }
 
 async function dbClear(table) {
-  if (useMemory) { memStore[table] = []; return; }
-  return db[table].clear();
+  if (useStorage === 'idb') return db[table].clear();
+  saveToLocal(table, []);
 }
 
 // ===== State =====
@@ -146,7 +173,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     setInterval(checkNotifications, 30000);
     setInterval(syncWithGAS, 60000);
     registerServiceWorker();
-    console.log('[Notes] App initialized OK');
+    console.log('[Notes] App initialized OK, storage=' + useStorage);
   } catch (err) {
     console.error('[Notes] Init error:', err);
     showToast('Ошибка запуска: ' + err.message);
