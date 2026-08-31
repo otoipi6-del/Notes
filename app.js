@@ -2,7 +2,7 @@
 
 dayjs.locale('ru');
 
-// ===== Database Wrapper (IndexedDB + Memory Fallback) =====
+// ===== Database =====
 let db;
 let useMemory = false;
 let memStore = { tasks: [], categories: [], attachments: [], syncQueue: [] };
@@ -16,38 +16,35 @@ const DEFAULT_CATEGORIES = [
 ];
 
 async function initDB() {
+  console.log('[Notes] Starting DB init...');
+
+  // Always delete old DB to avoid schema mismatch
+  try {
+    await Dexie.delete('NotesAppDB');
+    console.log('[Notes] Old DB deleted');
+  } catch (e) {
+    console.log('[Notes] No old DB to delete');
+  }
+
   db = new Dexie('NotesAppDB');
+  // Simple schema - only auto-increment id, filter in JS
   db.version(1).stores({
-    tasks: '++id, title, category, priority, date, time, completed, archived, recurrence, createdAt, updatedAt',
-    categories: '++id, name, order',
-    attachments: '++id, taskId, type, name, data, url',
-    syncQueue: '++id, action, table, data, timestamp'
+    tasks: '++id',
+    categories: '++id',
+    attachments: '++id',
+    syncQueue: '++id'
   });
 
   try {
     await db.open();
     console.log('[Notes] IndexedDB opened OK');
   } catch (err) {
-    console.warn('[Notes] IndexedDB open failed, trying recreate:', err);
-    try {
-      await Dexie.delete('NotesAppDB');
-      db = new Dexie('NotesAppDB');
-      db.version(1).stores({
-        tasks: '++id, title, category, priority, date, time, completed, archived, recurrence, createdAt, updatedAt',
-        categories: '++id, name, order',
-        attachments: '++id, taskId, type, name, data, url',
-        syncQueue: '++id, action, table, data, timestamp'
-      });
-      await db.open();
-      console.log('[Notes] IndexedDB recreated OK');
-    } catch (err2) {
-      console.warn('[Notes] IndexedDB recreate failed, using memory:', err2);
-      useMemory = true;
-      memStore.categories = DEFAULT_CATEGORIES.map((c, i) => ({ id: i + 1, ...c }));
-      nextId.categories = 5;
-      showToast('Работа без сохранения (режим инкогнито)');
-      return;
-    }
+    console.warn('[Notes] IndexedDB failed, using memory:', err);
+    useMemory = true;
+    memStore.categories = DEFAULT_CATEGORIES.map((c, i) => ({ id: i + 1, ...c }));
+    nextId.categories = 5;
+    showToast('Работа без сохранения (режим инкогнито)');
+    return;
   }
 
   try {
@@ -57,7 +54,7 @@ async function initDB() {
       console.log('[Notes] Default categories added');
     }
   } catch (e) {
-    console.warn('[Notes] Init categories error:', e);
+    console.warn('[Notes] Categories init error:', e);
   }
 }
 
@@ -73,15 +70,20 @@ async function dbGet(table, id) {
 }
 
 async function dbAdd(table, data) {
+  console.log('[Notes] dbAdd', table, JSON.stringify(data).substring(0, 200));
   if (useMemory) {
     const id = nextId[table]++;
     memStore[table].push({ ...data, id: id });
-    console.log('[Notes] Memory add', table, id);
     return id;
   }
-  const id = await db[table].add(data);
-  console.log('[Notes] DB add', table, id);
-  return id;
+  try {
+    const id = await db[table].add(data);
+    console.log('[Notes] DB add success, id=', id);
+    return id;
+  } catch (err) {
+    console.error('[Notes] DB add FAILED:', err, 'data=', data);
+    throw err;
+  }
 }
 
 async function dbUpdate(table, id, data) {
@@ -101,11 +103,6 @@ async function dbDelete(table, id) {
   return db[table].delete(id);
 }
 
-async function dbCount(table) {
-  if (useMemory) return memStore[table].length;
-  return db[table].count();
-}
-
 async function dbBulkPut(table, items) {
   if (useMemory) {
     for (const item of items) {
@@ -121,13 +118,6 @@ async function dbBulkPut(table, items) {
 async function dbClear(table) {
   if (useMemory) { memStore[table] = []; return; }
   return db[table].clear();
-}
-
-async function dbOrderBy(table, field) {
-  if (useMemory) {
-    return memStore[table].slice().sort((a, b) => (a[field] || 0) - (b[field] || 0));
-  }
-  return db[table].orderBy(field).toArray();
 }
 
 // ===== State =====
@@ -156,7 +146,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     setInterval(checkNotifications, 30000);
     setInterval(syncWithGAS, 60000);
     registerServiceWorker();
-    console.log('[Notes] App initialized');
+    console.log('[Notes] App initialized OK');
   } catch (err) {
     console.error('[Notes] Init error:', err);
     showToast('Ошибка запуска: ' + err.message);
@@ -258,7 +248,8 @@ function toggleTheme() {
 }
 
 async function loadCategories() {
-  categories = await dbOrderBy('categories', 'order');
+  categories = await dbGetAll('categories');
+  categories.sort((a, b) => (a.order || 0) - (b.order || 0));
   updateCategorySelects();
 }
 
@@ -348,6 +339,8 @@ async function saveTask(e) {
 
   if (!taskData.title) { showToast('Введите заголовок'); return; }
 
+  console.log('[Notes] Saving task:', taskData);
+
   try {
     let taskId;
     if (editingTaskId) {
@@ -355,15 +348,18 @@ async function saveTask(e) {
       const allAtts = await dbGetAll('attachments');
       const atts = allAtts.filter(a => a.taskId === editingTaskId);
       for (const a of atts) await dbDelete('attachments', a.id);
-      for (const att of tempAttachments) await dbAdd('attachments', { taskId: editingTaskId, ...att });
+      for (const att of tempAttachments) await dbAdd('attachments', { taskId: editingTaskId, type: att.type, name: att.name, data: att.data || null, url: att.url || null, mimeType: att.mimeType || null });
       taskId = editingTaskId;
       showToast('Задача обновлена');
     } else {
       taskData.completed = false;
       taskData.archived = false;
       taskData.createdAt = Date.now();
+      console.log('[Notes] About to dbAdd tasks with:', taskData);
       taskId = await dbAdd('tasks', taskData);
-      for (const att of tempAttachments) await dbAdd('attachments', { taskId: taskId, ...att });
+      for (const att of tempAttachments) {
+        await dbAdd('attachments', { taskId: taskId, type: att.type, name: att.name, data: att.data || null, url: att.url || null, mimeType: att.mimeType || null });
+      }
       showToast('Задача создана');
     }
 
@@ -782,7 +778,8 @@ async function syncWithGAS() {
     return;
   }
 
-  const queue = await dbOrderBy('syncQueue', 'timestamp');
+  const queue = await dbGetAll('syncQueue');
+  queue.sort((a, b) => (a.timestamp || 0) - (b.timestamp || 0));
   showToast('🔄 Синхронизация...');
 
   if (queue.length === 0) {
