@@ -16,9 +16,6 @@ const DEFAULT_CATEGORIES = [
 ];
 
 async function initDB() {
-  // Try delete old corrupted DB
-  try { await Dexie.delete('NotesAppDB'); } catch (e) {}
-
   db = new Dexie('NotesAppDB');
   db.version(1).stores({
     tasks: '++id, title, category, priority, date, time, completed, archived, recurrence, createdAt, updatedAt',
@@ -29,16 +26,38 @@ async function initDB() {
 
   try {
     await db.open();
+    console.log('[Notes] IndexedDB opened OK');
+  } catch (err) {
+    console.warn('[Notes] IndexedDB open failed, trying recreate:', err);
+    try {
+      await Dexie.delete('NotesAppDB');
+      db = new Dexie('NotesAppDB');
+      db.version(1).stores({
+        tasks: '++id, title, category, priority, date, time, completed, archived, recurrence, createdAt, updatedAt',
+        categories: '++id, name, order',
+        attachments: '++id, taskId, type, name, data, url',
+        syncQueue: '++id, action, table, data, timestamp'
+      });
+      await db.open();
+      console.log('[Notes] IndexedDB recreated OK');
+    } catch (err2) {
+      console.warn('[Notes] IndexedDB recreate failed, using memory:', err2);
+      useMemory = true;
+      memStore.categories = DEFAULT_CATEGORIES.map((c, i) => ({ id: i + 1, ...c }));
+      nextId.categories = 5;
+      showToast('Работа без сохранения (режим инкогнито)');
+      return;
+    }
+  }
+
+  try {
     const count = await db.categories.count();
     if (count === 0) {
       await db.categories.bulkAdd(DEFAULT_CATEGORIES);
+      console.log('[Notes] Default categories added');
     }
-  } catch (err) {
-    console.warn('IndexedDB failed, using memory mode:', err);
-    useMemory = true;
-    memStore.categories = DEFAULT_CATEGORIES.map((c, i) => ({ id: i + 1, ...c }));
-    nextId.categories = 5;
-    showToast('Работа без сохранения (режим инкогнито или ошибка БД)');
+  } catch (e) {
+    console.warn('[Notes] Init categories error:', e);
   }
 }
 
@@ -49,7 +68,7 @@ async function dbGetAll(table) {
 }
 
 async function dbGet(table, id) {
-  if (useMemory) return memStore[table].find(x => x.id === id);
+  if (useMemory) return memStore[table].find(x => x.id === id) || null;
   return db[table].get(id);
 }
 
@@ -57,9 +76,12 @@ async function dbAdd(table, data) {
   if (useMemory) {
     const id = nextId[table]++;
     memStore[table].push({ ...data, id: id });
+    console.log('[Notes] Memory add', table, id);
     return id;
   }
-  return db[table].add(data);
+  const id = await db[table].add(data);
+  console.log('[Notes] DB add', table, id);
+  return id;
 }
 
 async function dbUpdate(table, id, data) {
@@ -82,16 +104,6 @@ async function dbDelete(table, id) {
 async function dbCount(table) {
   if (useMemory) return memStore[table].length;
   return db[table].count();
-}
-
-async function dbWhere(table, field, value) {
-  if (useMemory) return memStore[table].filter(x => x[field] === value);
-  return db[table].where(field).equals(value).toArray();
-}
-
-async function dbWhereAnd(table, field, value, predicate) {
-  const all = await dbWhere(table, field, value);
-  return all.filter(predicate);
 }
 
 async function dbBulkPut(table, items) {
@@ -144,8 +156,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     setInterval(checkNotifications, 30000);
     setInterval(syncWithGAS, 60000);
     registerServiceWorker();
+    console.log('[Notes] App initialized');
   } catch (err) {
-    console.error('Init error:', err);
+    console.error('[Notes] Init error:', err);
     showToast('Ошибка запуска: ' + err.message);
   }
 });
@@ -270,7 +283,8 @@ async function addCategory() {
 async function deleteCategory(id) {
   const cat = categories.find(c => c.id === id);
   if (!cat) return;
-  const tasksWithCat = await dbWhere('tasks', 'category', cat.name);
+  const allTasks = await dbGetAll('tasks');
+  const tasksWithCat = allTasks.filter(t => t.category === cat.name);
   if (tasksWithCat.length > 0) { showToast('Нельзя удалить: есть задачи'); return; }
   await dbDelete('categories', id);
   await loadCategories();
@@ -338,7 +352,8 @@ async function saveTask(e) {
     let taskId;
     if (editingTaskId) {
       await dbUpdate('tasks', editingTaskId, taskData);
-      const atts = await dbWhere('attachments', 'taskId', editingTaskId);
+      const allAtts = await dbGetAll('attachments');
+      const atts = allAtts.filter(a => a.taskId === editingTaskId);
       for (const a of atts) await dbDelete('attachments', a.id);
       for (const att of tempAttachments) await dbAdd('attachments', { taskId: editingTaskId, ...att });
       taskId = editingTaskId;
@@ -352,6 +367,7 @@ async function saveTask(e) {
       showToast('Задача создана');
     }
 
+    console.log('[Notes] Task saved, id=' + taskId);
     queueSync('upsert', 'tasks', { id: taskId, ...taskData });
 
     if (taskData.gcal && taskData.date) addToGoogleCalendar(taskData);
@@ -360,8 +376,8 @@ async function saveTask(e) {
     closeAllModals();
     renderView();
   } catch (err) {
-    console.error(err);
-    showToast('Ошибка сохранения');
+    console.error('[Notes] Save error:', err);
+    showToast('Ошибка сохранения: ' + err.message);
   }
 }
 
@@ -407,7 +423,8 @@ async function deleteTask() {
   if (!editingTaskId) return;
   if (!confirm('Удалить задачу безвозвратно?')) return;
   await dbDelete('tasks', editingTaskId);
-  const atts = await dbWhere('attachments', 'taskId', editingTaskId);
+  const allAtts = await dbGetAll('attachments');
+  const atts = allAtts.filter(a => a.taskId === editingTaskId);
   for (const a of atts) await dbDelete('attachments', a.id);
   queueSync('delete', 'tasks', { id: editingTaskId });
   closeAllModals();
@@ -434,7 +451,8 @@ async function restoreFromArchive(id) {
 async function deleteFromArchive(id) {
   if (!confirm('Удалить из архива?')) return;
   await dbDelete('tasks', id);
-  const atts = await dbWhere('attachments', 'taskId', id);
+  const allAtts = await dbGetAll('attachments');
+  const atts = allAtts.filter(a => a.taskId === id);
   for (const a of atts) await dbDelete('attachments', a.id);
   queueSync('delete', 'tasks', { id: id });
   renderView();
@@ -442,12 +460,14 @@ async function deleteFromArchive(id) {
 }
 
 async function clearArchive() {
-  const archived = await dbWhere('tasks', 'archived', true);
+  const allTasks = await dbGetAll('tasks');
+  const archived = allTasks.filter(t => t.archived);
   if (archived.length === 0) { showToast('Архив пуст'); return; }
   if (!confirm('Удалить ' + archived.length + ' задач?')) return;
   for (const t of archived) {
     await dbDelete('tasks', t.id);
-    const atts = await dbWhere('attachments', 'taskId', t.id);
+    const allAtts = await dbGetAll('attachments');
+    const atts = allAtts.filter(a => a.taskId === t.id);
     for (const a of atts) await dbDelete('attachments', a.id);
     queueSync('delete', 'tasks', { id: t.id });
   }
@@ -518,7 +538,10 @@ async function renderList() {
   const catFilter = $('#categoryFilter').value;
   const priFilter = $('#priorityFilter').value;
 
-  let tasks = await dbWhere('tasks', 'archived', false);
+  let tasks = await dbGetAll('tasks');
+  tasks = tasks.filter(t => !t.archived);
+  console.log('[Notes] renderList total active:', tasks.length);
+
   if (search) tasks = tasks.filter(t => t.title.toLowerCase().includes(search) || (t.description || '').toLowerCase().includes(search));
   if (catFilter) tasks = tasks.filter(t => t.category === catFilter);
   if (priFilter) tasks = tasks.filter(t => t.priority === priFilter);
@@ -571,8 +594,8 @@ async function openTaskModalById(id) {
 }
 
 async function renderArchive() {
-  const tasks = await dbWhere('tasks', 'archived', true);
-  tasks.reverse();
+  let tasks = await dbGetAll('tasks');
+  tasks = tasks.filter(t => t.archived).reverse();
   const list = $('#archiveList');
   if (tasks.length === 0) {
     list.innerHTML = '<div class="empty-state"><div class="empty-state-icon">🗄</div><div class="empty-state-text">Архив пуст</div></div>';
@@ -623,9 +646,10 @@ function renderCalendar() {
 }
 
 async function renderCalendarDots() {
-  const tasks = await dbWhere('tasks', 'archived', false);
+  const tasks = await dbGetAll('tasks');
+  const activeTasks = tasks.filter(t => !t.archived);
   const dotsByDate = {};
-  tasks.forEach(t => {
+  activeTasks.forEach(t => {
     if (!t.date) return;
     if (!dotsByDate[t.date]) dotsByDate[t.date] = new Set();
     dotsByDate[t.date].add(t.priority || 'medium');
@@ -647,21 +671,23 @@ async function selectCalendarDate(date) {
 }
 
 async function renderCalendarTasks(date) {
-  const tasks = await dbWhereAnd('tasks', 'archived', false, t => t.date === date);
+  const tasks = await dbGetAll('tasks');
+  const dayTasks = tasks.filter(t => !t.archived && t.date === date);
   const container = $('#calendarTasks');
-  if (tasks.length === 0) {
+  if (dayTasks.length === 0) {
     container.innerHTML = '<div class="empty-state"><div class="empty-state-text">Нет задач на ' + dayjs(date).format('DD.MM.YY') + '</div></div>';
     return;
   }
-  container.innerHTML = '<h3 style="margin-bottom:10px;font-size:1rem;">📅 ' + dayjs(date).format('DD MMMM') + '</h3>' + tasks.map(t => renderTaskCard(t)).join('');
+  container.innerHTML = '<h3 style="margin-bottom:10px;font-size:1rem;">📅 ' + dayjs(date).format('DD MMMM') + '</h3>' + dayTasks.map(t => renderTaskCard(t)).join('');
 }
 
 async function checkNotifications() {
   if (!('Notification' in window)) return;
   if (Notification.permission !== 'granted') return;
   const now = dayjs();
-  const tasks = await dbWhereAnd('tasks', 'archived', false, t => !t.completed);
-  for (const task of tasks) {
+  const tasks = await dbGetAll('tasks');
+  const activeTasks = tasks.filter(t => !t.archived && !t.completed);
+  for (const task of activeTasks) {
     if (!task.date) continue;
     const taskDateTime = dayjs(task.date + ' ' + (task.time || '00:00'));
     const notifyTime = taskDateTime.subtract(task.notifyBefore || 0, 'minute');
@@ -701,8 +727,8 @@ function requestNotificationPermission() {
 
 async function sendTelegramNotification(task) {
   if (!tgToken || !tgChatId) return;
-  if (window.location.protocol === 'file:') return; // Can't send from file://
-  const text = '🔔 *Напоминание*\\n\\n*' + task.title + '*' + (task.description ? '\\n' + task.description : '') + '\\n📅 ' + task.date + (task.time ? ' ' + task.time : '');
+  if (window.location.protocol === 'file:') return;
+  const text = '🔔 *Напоминание*\\\\n\\\\n*' + task.title + '*' + (task.description ? '\\\\n' + task.description : '') + '\\\\n📅 ' + task.date + (task.time ? ' ' + task.time : '');
   try {
     await fetch('https://api.telegram.org/bot' + tgToken + '/sendMessage', {
       method: 'POST',
@@ -751,8 +777,6 @@ async function queueSync(action, table, data) {
 async function syncWithGAS() {
   if (!gasUrl) { showToast('Введите URL GAS в настройках'); return; }
   if (!navigator.onLine) { showToast('Нет интернет-соединения'); return; }
-
-  // Check if running from file:// (CORS blocked)
   if (window.location.protocol === 'file:') {
     showToast('⚠️ Запустите через http://localhost (см. инструкцию)');
     return;
